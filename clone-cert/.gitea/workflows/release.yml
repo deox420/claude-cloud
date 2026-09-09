@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  releases: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate Bash implementation
+        run: |
+          bash -n clone-cert.sh
+          bash clone-cert.sh --self-test
+
+      - name: Build release assets
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p dist
+          cp clone-cert.sh dist/clone-cert.sh
+          tar -czf "dist/clone-cert-${GITEA_REF_NAME}.tar.gz" clone-cert.sh README.md
+          sha256sum dist/* > "dist/SHA256SUMS.txt"
+
+      - name: Create release and upload assets
+        uses: https://gitea.ad.cybser.es/Lab/gitea_actions@v1
+        with:
+          server_url: ${{ gitea.server_url }}
+          repository: ${{ gitea.repository }}
+          token: ${{ secrets.GITEA_TOKEN }}
+          prerelease: auto
+          asset_glob: dist/*

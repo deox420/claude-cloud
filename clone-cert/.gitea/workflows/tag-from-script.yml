@@ -1,0 +1,57 @@
+name: Tag From Script
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - clone-cert.sh
+
+permissions:
+  contents: write
+  releases: write
+
+jobs:
+  tag-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create version tag if missing
+        shell: sh
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_SERVER_URL: ${{ gitea.server_url }}
+          GITEA_REPOSITORY: ${{ gitea.repository }}
+        run: |
+          set -eu
+          version="$(sed -n 's/^readonly TOOL_VERSION="\([0-9][0-9.]*\)"$/\1/p' clone-cert.sh)"
+          test -n "${version}"
+          tag_name="v${version}"
+
+          git fetch --tags origin
+          if git rev-parse "${tag_name}" >/dev/null 2>&1; then
+            printf 'Tag %s already exists, skipping.\n' "${tag_name}"
+            exit 0
+          fi
+
+          git config user.name "gitea-actions"
+          git config user.email "gitea-actions@localhost"
+          git tag "${tag_name}"
+
+          remote_url="${GITEA_SERVER_URL%/}/${GITEA_REPOSITORY}.git"
+          auth_url="$(python3 - "${remote_url}" "${GITEA_TOKEN}" <<'PY'
+import sys
+from urllib.parse import quote, urlsplit, urlunsplit
+
+parts = urlsplit(sys.argv[1])
+netloc = f"x-access-token:{quote(sys.argv[2], safe='')}@{parts.netloc}"
+print(urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)))
+PY
+)"
+          git push "${auth_url}" "${tag_name}"
+          printf 'Created and pushed %s.\n' "${tag_name}"
