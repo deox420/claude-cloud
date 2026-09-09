@@ -203,7 +203,7 @@ Para `leaf→int→CA` con claves nuevas en todos los niveles habría que: regen
 la clave del root (auto-firma), reemitir la(s) intermedia(s) firmada(s) por el
 root clonado, y reemitir el leaf firmado por la intermedia clonada. La
 herramienta no hace esto: o firma el leaf bajo un emisor **que aportas**
-(original) o bajo **un** emisor generado. (Mi prototipo de referencia
+(original) o bajo **un** emisor generado. (La herramienta Python
 `clonecert.py` sí implementa el reclonado top-down de N niveles; ver §8.)
 
 ### 5.3 Conjunto de cambios muy reducido
@@ -351,15 +351,22 @@ tenía el `sed` del original de SySS. Reconstruir el certificado parseando ASN.1
 de verdad (Python + `cryptography`) elimina esa fragilidad y hace triviales las
 pautas 3, 5 y 6.
 
-Como referencia, en esta misma rama incluyo un **prototipo funcional**
-`reference/clonecert.py` (Python + `cryptography`) que ya implementa:
-reclonado de cadena de N niveles, modificación de **cualquier** parámetro de
-**cualquier** certificado (incluidas extensiones arbitrarias por OID), todos los
-tipos de clave (RSA/EC/Ed25519/Ed448/DSA) y firma (incl. RSA-PSS), copiado
-verbatim de extensiones (idéntico salvo lo cambiado), y subcomandos
-`identify`/`validate`/`clone`. Probado: clona la cadena completa y **revalida**;
-el leaf clonado es idéntico en todos sus parámetros salvo clave y firma.
+**Decisión tomada:** pasar a Python y rescatar lo bueno del Bash. La herramienta
+mejorada vive en [`clonecert.py`](clonecert.py) (Python + `cryptography`), con
+[`README.md`](README.md), `requirements.txt`, `selftest` integrado (12 casos
+offline) y CI en `.github/workflows/ci.yml`. El `clone-cert.sh` original se
+conserva en `clone-cert/` como material revisado.
 
-Es sólo una **referencia/propuesta de dirección**, no un reemplazo impuesto.
-Dime si prefieres que aplique los arreglos P0/P1 **sobre tu `clone-cert.sh`**
-(mantener Bash) o que consolide el prototipo Python como la vía "mejorada".
+`clonecert.py` implementa todas tus pautas: reclonado de cadena de **N
+niveles** (re-firma top-down), modificación de **cualquier** parámetro de
+**cualquier** certificado por índice (`--index N` / `--mods JSON`), incluidas
+extensiones arbitrarias por OID (`--set-ext`/`--del-ext`), SAN de todos los tipos
+(dns/ip/email/uri), todos los tipos de clave (RSA/EC/Ed25519/Ed448/DSA) y firma
+(incl. RSA-PSS), y copiado **verbatim** de extensiones (idéntico salvo lo
+cambiado, conservando también el algoritmo de firma del original). Rescata del
+Bash: subcomandos, captura con transporte por puerto (TLS/STARTTLS/DTLS) +
+`--transport`, directorios de captura únicos + manifiestos, `--dry-run`,
+verificación emisor↔clave y post-emisión, `--out-dir` vacío + anti-symlink,
+permisos `0600` y la derivación homoglifo del emisor. Comprobado: clona cadenas
+completas y **revalida** (también con `openssl verify`); un clon sin cambios es
+idéntico al original en todos sus parámetros salvo clave y firma.
