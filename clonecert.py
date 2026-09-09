@@ -113,6 +113,19 @@ def utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
 
 
+def cert_nvb(cert: "x509.Certificate") -> _dt.datetime:
+    """not_valid_before as naive-UTC, using the non-deprecated *_utc accessor
+    when the installed cryptography exposes it (>=42), falling back otherwise."""
+    v = getattr(cert, "not_valid_before_utc", None)
+    return v.replace(tzinfo=None) if v is not None else cert.not_valid_before
+
+
+def cert_nva(cert: "x509.Certificate") -> _dt.datetime:
+    """not_valid_after as naive-UTC (see cert_nvb)."""
+    v = getattr(cert, "not_valid_after_utc", None)
+    return v.replace(tzinfo=None) if v is not None else cert.not_valid_after
+
+
 def safe_stem(value: str) -> str:
     """Turn an arbitrary target string into a safe output-filename stem."""
     value = re.sub(r"\.(pem|der|crt|cert|cer)$", "", value, flags=re.IGNORECASE)
@@ -298,10 +311,16 @@ def signing_params(orig: x509.Certificate, signer_key, hash_override: str | None
     if isinstance(signer_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
         return None, None
     if hash_override is not None:
-        cls = _HASHES.get(hash_override.lower())
-        if cls is None and hash_override.lower() != "none":
+        key = hash_override.lower()
+        cls = _HASHES.get(key)
+        if cls is None and key != "none":
             die(f"unknown signature hash: {hash_override!r}")
-        hash_alg = cls() if cls else hashes.SHA256()
+        if key == "none":
+            # "none" only makes sense for Ed25519/Ed448 (handled above); for
+            # RSA/EC/DSA a hash is mandatory, so fail loudly instead of
+            # silently substituting SHA-256.
+            die("signature hash 'none' is only valid for ed25519/ed448 keys")
+        hash_alg = cls()
     else:
         hash_alg = orig.signature_hash_algorithm or hashes.SHA256()
     rsa_pad = None
@@ -357,14 +376,17 @@ def verify_signed_by(cert: x509.Certificate, issuer_pub) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 def load_certs_from_bytes(data: bytes) -> list[x509.Certificate]:
     certs: list[x509.Certificate] = []
-    if b"-----BEGIN CERTIFICATE-----" in data:
-        # PEM, possibly surrounded by other text (e.g. openssl s_client output)
-        for block in re.findall(
-            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", data, re.DOTALL
-        ):
-            certs.append(x509.load_pem_x509_certificate(block))
-    else:
-        certs.append(x509.load_der_x509_certificate(data))
+    try:
+        if b"-----BEGIN CERTIFICATE-----" in data:
+            # PEM, possibly surrounded by other text (e.g. openssl s_client output)
+            for block in re.findall(
+                rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", data, re.DOTALL
+            ):
+                certs.append(x509.load_pem_x509_certificate(block))
+        else:
+            certs.append(x509.load_der_x509_certificate(data))
+    except ValueError as exc:
+        die(f"could not parse certificate data: {exc}")
     if not certs:
         die("no certificate found in input")
     return certs
@@ -458,9 +480,11 @@ def fetch_certs(host: str, port: int, sni: str, timeout: float,
         return fetch_via_openssl(host, port, sni, timeout, transport, openssl)
     if transport != "tls":
         die(f"{transport} transport requires the openssl command, which was not found")
-    if openssl and not want_chain:
-        # python ssl gives us just the leaf, which is all that's asked for
-        return fetch_leaf_via_python(host, port, sni, timeout)
+    if want_chain:
+        # Python's ssl only exposes the leaf; returning it silently under
+        # --chain would produce a wrong (leaf-only) result, so fail clearly.
+        die("fetching the whole chain from a live endpoint requires the openssl "
+            "command, which was not found (install it, or drop --chain)")
     return fetch_leaf_via_python(host, port, sni, timeout)
 
 
@@ -561,8 +585,8 @@ def describe_cert(cert: x509.Certificate, index: int) -> dict:
         "serial": f"{cert.serial_number:x}",
         "subject": cert.subject.rfc4514_string(),
         "issuer": cert.issuer.rfc4514_string(),
-        "not_before": cert.not_valid_before.isoformat(),
-        "not_after": cert.not_valid_after.isoformat(),
+        "not_before": cert_nvb(cert).isoformat(),
+        "not_after": cert_nva(cert).isoformat(),
         "signature_algorithm": cert.signature_algorithm_oid._name or cert.signature_algorithm_oid.dotted_string,
         "public_key": key_details(cert.public_key()),
         "sha256_fingerprint": cert.fingerprint(hashes.SHA256()).hex(),
@@ -605,10 +629,11 @@ def cmd_validate(args) -> int:
     all_ok = True
     for i, cert in enumerate(certs):
         label = f"#{i} {cert.subject.rfc4514_string()}"
-        if cert.not_valid_before > now:
-            warn(f"{label}: not yet valid (starts {cert.not_valid_before})")
-        if cert.not_valid_after < now:
-            warn(f"{label}: expired ({cert.not_valid_after})")
+        nvb, nva = cert_nvb(cert), cert_nva(cert)
+        if nvb > now:
+            warn(f"{label}: not yet valid (starts {nvb})")
+        if nva < now:
+            warn(f"{label}: expired ({nva})")
         parent = certs[i + 1] if i + 1 < len(certs) else (
             cert if cert.subject == cert.issuer else None)
         if parent is None:
@@ -818,13 +843,16 @@ def build_extensions(orig: x509.Certificate, mod: dict, new_key, *,
         put(ExtensionOID.EXTENDED_KEY_USAGE, build_eku(mod["ext_key_usage"]), False)
 
     for spec in mod.get("ext_set", []):
-        if isinstance(spec, dict):
-            oid, crit, der = ObjectIdentifier(spec["oid"]), bool(spec.get("critical", False)), bytes.fromhex(spec["der_hex"])
-        else:
-            parts = str(spec).split(":")
-            if len(parts) != 3:
-                die(f"--set-ext expects OID:critical:der_hex, got {spec!r}")
-            oid, crit, der = ObjectIdentifier(parts[0]), parts[1].lower() in ("1", "true", "yes", "crit"), bytes.fromhex(parts[2])
+        try:
+            if isinstance(spec, dict):
+                oid, crit, der = ObjectIdentifier(spec["oid"]), bool(spec.get("critical", False)), bytes.fromhex(spec["der_hex"])
+            else:
+                parts = str(spec).split(":")
+                if len(parts) != 3:
+                    die(f"--set-ext expects OID:critical:der_hex, got {spec!r}")
+                oid, crit, der = ObjectIdentifier(parts[0]), parts[1].lower() in ("1", "true", "yes", "crit"), bytes.fromhex(parts[2])
+        except (ValueError, KeyError) as exc:
+            die(f"invalid --set-ext {spec!r}: {exc} (expected OID:critical:der_hex)")
         put(oid, x509.UnrecognizedExtension(oid, der), crit)
 
     for spec in mod.get("ext_delete", []):
@@ -905,19 +933,19 @@ def clone_chain(certs: list[x509.Certificate], mods: dict[int, dict], *,
             # point the child's AKI at it below.
             ca_ski = None if recompute_ski else get_aki(orig)
             outcome.fake_ca = build_fake_ca(issuer_name, ca_ski,
-                                            certs[i].not_valid_before, certs[i].not_valid_after)
+                                            cert_nvb(certs[i]), cert_nva(certs[i]))
             signer_key = outcome.fake_ca.key
             signer_new_ski = get_ski(outcome.fake_ca.cert)
             log(f"#{i}: fabricated issuing CA '{issuer_name.rfc4514_string()}'")
 
         serial = parse_serial(mod["serial"]) if mod.get("serial") is not None else orig.serial_number
-        nb = parse_datetime(mod["not_before"]) if mod.get("not_before") else orig.not_valid_before
+        nb = parse_datetime(mod["not_before"]) if mod.get("not_before") else cert_nvb(orig)
         if mod.get("not_after"):
             na = parse_datetime(mod["not_after"])
         elif mod.get("days") is not None:
             na = nb + _dt.timedelta(days=int(mod["days"]))
         else:
-            na = orig.not_valid_after
+            na = cert_nva(orig)
 
         builder = (x509.CertificateBuilder().subject_name(subjects[i]).issuer_name(issuer_name)
                    .public_key(new_key.public_key()).serial_number(serial)
@@ -977,7 +1005,8 @@ def sanity_check(outcome: CloneOutcome) -> None:
             die(f"sanity check failed: {c.cert.subject.rfc4514_string()} does not verify ({msg})")
 
 
-def write_manifest(path: Path, *, sources, outcome, mods, ca_supplied: bool) -> None:
+def write_manifest(path: Path, *, sources, outcome, mods, ca_supplied: bool,
+                   recompute_ski: bool = False) -> None:
     manifest = {
         "tool": "clonecert", "tool_version": __version__, "operation": "clone",
         "generated_utc": utcnow().isoformat() + "Z",
@@ -993,12 +1022,15 @@ def write_manifest(path: Path, *, sources, outcome, mods, ca_supplied: bool) -> 
             "key": key_details(cl.cert.public_key()),
             "modified_fields": modified_fields(mods.get(i, {})),
         })
+    # public key and signature are always regenerated; SKI/AKI only when the
+    # user asked to recompute them from the new keys (otherwise kept verbatim).
     manifest["derived_fields"] = ["public_key", "signature"] + (
-        ["subject_key_identifier", "authority_key_identifier"] if False else [])
+        ["subject_key_identifier", "authority_key_identifier"] if recompute_ski else [])
     path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def emit_clones(outcome: CloneOutcome, sources, mods, outdir: Path, stem: str, ca_supplied: bool) -> None:
+def emit_clones(outcome: CloneOutcome, sources, mods, outdir: Path, stem: str, ca_supplied: bool,
+                recompute_ski: bool = False) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     chain_pem = bytearray()
     for i, c in enumerate(outcome.clones):
@@ -1017,7 +1049,7 @@ def emit_clones(outcome: CloneOutcome, sources, mods, outdir: Path, stem: str, c
         warn("the generated issuing CA is not trusted by clients unless explicitly installed")
     (outdir / f"{stem}.chain.pem").write_bytes(bytes(chain_pem))
     write_manifest(outdir / "manifest.json", sources=sources, outcome=outcome,
-                   mods=mods, ca_supplied=ca_supplied)
+                   mods=mods, ca_supplied=ca_supplied, recompute_ski=recompute_ski)
 
 
 def render_dry_run(certs, mods) -> None:
@@ -1058,17 +1090,27 @@ def cmd_clone(args) -> int:
         die("--self-signed cannot be combined with a supplied CA")
     ca_cert = ca_key = None
     if args.ca_cert:
-        ca_cert = x509.load_pem_x509_certificate(Path(args.ca_cert).read_bytes())
-        ca_key = serialization.load_pem_private_key(Path(args.ca_key).read_bytes(), password=None)
+        try:
+            ca_cert = x509.load_pem_x509_certificate(Path(args.ca_cert).read_bytes())
+        except (OSError, ValueError) as exc:
+            die(f"could not load --ca-cert {args.ca_cert!r}: {exc}")
+        try:
+            ca_key = serialization.load_pem_private_key(Path(args.ca_key).read_bytes(), password=None)
+        except TypeError:
+            die(f"--ca-key {args.ca_key!r} is encrypted; decrypt it first "
+                "(clonecert does not prompt for key passwords)")
+        except (OSError, ValueError) as exc:
+            die(f"could not load --ca-key {args.ca_key!r}: {exc}")
         if public_der(ca_cert.public_key()) != public_der(ca_key.public_key()):
             die("--ca-cert and --ca-key do not match")
 
     certs = load_input(args)
     certs = order_chain(certs) if args.chain else certs[:1]
     mods = collect_mods(args)
-    if mods and max(mods) >= len(certs):
-        die(f"--index/--mods references cert #{max(mods)} but only {len(certs)} loaded "
-            f"(did you forget --chain?)")
+    bad = sorted(i for i in mods if i < 0 or i >= len(certs))
+    if bad:
+        die(f"--index/--mods references cert #{bad[0]} but only {len(certs)} "
+            f"certificate(s) loaded (indices 0..{len(certs) - 1}; did you forget --chain?)")
 
     if args.dry_run:
         render_dry_run(certs, mods)
@@ -1081,7 +1123,8 @@ def cmd_clone(args) -> int:
                           fake_issuer_subject=args.fake_issuer_subject, recompute_ski=args.recompute_ski)
     sanity_check(outcome)
     label = args.target if not os.path.exists(args.target) else Path(args.target).name
-    emit_clones(outcome, certs, mods, outdir, safe_stem(label), ca_supplied=ca_cert is not None)
+    emit_clones(outcome, certs, mods, outdir, safe_stem(label), ca_supplied=ca_cert is not None,
+                recompute_ski=args.recompute_ski)
     return 0
 
 
