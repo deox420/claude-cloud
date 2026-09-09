@@ -7,7 +7,7 @@ Bash tool. Certificates are parsed and rebuilt with the `cryptography`
 library instead of doing byte/text surgery with `sed`/`openssl`, which makes
 it possible to:
 
-  * capture a chain from a live TLS server (host:port, SNI, STARTTLS, DTLS),
+  * read from a live TLS server (host:port, SNI, STARTTLS, DTLS) or a file,
   * clone a single leaf or a whole chain: leaf -> intermediate(s) -> CA,
     self-signed or CA-issued,
   * modify ANY parameter of ANY certificate in the chain (subject, issuer,
@@ -1035,60 +1035,18 @@ def render_dry_run(certs, mods) -> None:
 # Commands: capture / clone                                                   #
 # --------------------------------------------------------------------------- #
 def load_input(args) -> list[x509.Certificate]:
-    if args.in_file and args.connect:
-        die("use either --in or --connect, not both")
-    if args.in_file:
-        return load_certs_from_bytes(Path(args.in_file).read_bytes())
-    if args.connect:
-        host, port, sni = parse_hostport(args.connect)
-        if getattr(args, "sni", None):
-            sni = args.sni
-        transport = getattr(args, "transport", "auto") or "auto"
-        if transport == "auto":
-            transport = transport_for_port(port)
-        return fetch_certs(host, port, sni, args.timeout, transport, getattr(args, "chain", False))
-    die("no input: pass --in FILE or --connect [sni@]host:port")
-
-
-def cmd_capture(args) -> int:
-    host, port, sni = parse_hostport(args.connect)
-    if args.sni:
+    """Read certificate(s) from the positional target: a file or [sni@]host:port."""
+    target = args.target
+    if os.path.exists(target):
+        return load_certs_from_bytes(Path(target).read_bytes())
+    host, port, sni = parse_hostport(target)
+    if getattr(args, "sni", None):
         sni = args.sni
-    transport = args.transport if args.transport != "auto" else transport_for_port(port)
-    log(f"connecting to {host}:{port} via {transport}"
-        + (f" (SNI {sni})" if sni else ""))
-    certs = fetch_certs(host, port, sni, args.timeout, transport, want_chain=True)
-    certs = order_chain(certs)
-    for i, c in enumerate(certs):
-        d = describe_cert(c, i)
-        print(f"  #{i} {d['role']}: {d['subject']}  [{d['sha256_fingerprint'][:16]}...]")
-
-    base = Path(args.out_dir)
-    base.mkdir(parents=True, exist_ok=True)
-    cn = None
-    try:
-        cn = certs[0].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-    except (IndexError, x509.ExtensionNotFound):
-        cn = host
-    slug = safe_stem(cn or host)
-    ts = utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fp = certs[0].fingerprint(hashes.SHA256()).hex()[:12]
-    capture_dir = base / f"{slug}-{port}-{ts}-{fp}"
-    if capture_dir.exists():
-        die(f"capture directory already exists: {capture_dir}")
-    capture_dir.mkdir()
-    bundle = capture_dir / f"{slug}-chain.pem"
-    bundle.write_bytes(b"".join(c.public_bytes(serialization.Encoding.PEM) for c in certs))
-    manifest = {
-        "tool": "clonecert", "tool_version": __version__, "operation": "capture",
-        "connect": f"{host}:{port}", "transport": transport, "sni": sni,
-        "captured_utc": ts, "certificate_count": len(certs),
-        "certificates_sha256": [c.fingerprint(hashes.SHA256()).hex() for c in certs],
-    }
-    (capture_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    log(f"saved capture to {capture_dir}")
-    print(bundle)
-    return 0
+    transport = getattr(args, "transport", "auto") or "auto"
+    if transport == "auto":
+        transport = transport_for_port(port)
+    log(f"connecting to {host}:{port} via {transport}" + (f" (SNI {sni})" if sni else ""))
+    return fetch_certs(host, port, sni, args.timeout, transport, getattr(args, "chain", False))
 
 
 def cmd_clone(args) -> int:
@@ -1122,7 +1080,7 @@ def cmd_clone(args) -> int:
                           keep_issuer_name=args.keep_issuer_name, force_self_signed=args.self_signed,
                           fake_issuer_subject=args.fake_issuer_subject, recompute_ski=args.recompute_ski)
     sanity_check(outcome)
-    label = args.connect or (Path(args.in_file).name if args.in_file else "cert")
+    label = args.target if not os.path.exists(args.target) else Path(args.target).name
     emit_clones(outcome, certs, mods, outdir, safe_stem(label), ca_supplied=ca_cert is not None)
     return 0
 
@@ -1280,17 +1238,16 @@ def _run_validate(certs) -> int:
 # --------------------------------------------------------------------------- #
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
-def add_input_args(p: argparse.ArgumentParser, with_transport: bool = True) -> None:
-    p.add_argument("--connect", metavar="[sni@]host:port", help="fetch from a live TLS server")
-    p.add_argument("--in", dest="in_file", metavar="FILE", help="read from a PEM/DER file or bundle")
-    p.add_argument("--sni", help="override the SNI sent with --connect")
+def add_input_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("target", metavar="host:port|file",
+                   help="a live TLS endpoint '[sni@]host:port' or a PEM/DER file/bundle")
+    p.add_argument("--sni", help="override the SNI sent to a live endpoint")
     p.add_argument("--timeout", type=float, default=10.0, help="connection timeout seconds (default 10)")
     p.add_argument("--chain", action="store_true", help="operate on the whole chain, not just the leaf")
-    if with_transport:
-        p.add_argument("--transport", default="auto",
-                       choices=["auto", "tls", "starttls-smtp", "starttls-imap", "starttls-pop3",
-                                "starttls-ldap", "starttls-xmpp", "dtls"],
-                       help="transport for --connect (default: auto by port)")
+    p.add_argument("--transport", default="auto",
+                   choices=["auto", "tls", "starttls-smtp", "starttls-imap", "starttls-pop3",
+                            "starttls-ldap", "starttls-xmpp", "dtls"],
+                   help="transport for a live endpoint (default: auto by port)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1308,16 +1265,6 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("validate", help="verify a chain is internally consistent")
     add_input_args(pv)
     pv.set_defaults(func=cmd_validate)
-
-    pcap = sub.add_parser("capture", help="save a live server's chain (+ manifest) to a directory")
-    pcap.add_argument("connect", metavar="[sni@]host:port")
-    pcap.add_argument("--sni")
-    pcap.add_argument("--timeout", type=float, default=10.0)
-    pcap.add_argument("--transport", default="auto",
-                      choices=["auto", "tls", "starttls-smtp", "starttls-imap", "starttls-pop3",
-                               "starttls-ldap", "starttls-xmpp", "dtls"])
-    pcap.add_argument("-d", "--out-dir", required=True)
-    pcap.set_defaults(func=cmd_capture)
 
     pc = sub.add_parser("clone", help="clone a certificate or a whole chain")
     add_input_args(pc)

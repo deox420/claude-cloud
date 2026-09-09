@@ -364,8 +364,8 @@ extensiones arbitrarias por OID (`--set-ext`/`--del-ext`), SAN de todos los tipo
 (dns/ip/email/uri), todos los tipos de clave (RSA/EC/Ed25519/Ed448/DSA) y firma
 (incl. RSA-PSS), y copiado **verbatim** de extensiones (idéntico salvo lo
 cambiado, conservando también el algoritmo de firma del original). Rescata del
-Bash: subcomandos, captura con transporte por puerto (TLS/STARTTLS/DTLS) +
-`--transport`, directorios de captura únicos + manifiestos, `--dry-run`,
+Bash: subcomandos, transporte por puerto (TLS/STARTTLS/DTLS) +
+`--transport`, `manifest.json` del clonado con provenance, `--dry-run`,
 verificación emisor↔clave y post-emisión, `--out-dir` vacío + anti-symlink,
 permisos `0600` y la derivación homoglifo del emisor. Comprobado: clona cadenas
 completas y **revalida** (también con `openssl verify`); un clon sin cambios es

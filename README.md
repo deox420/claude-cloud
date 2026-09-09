@@ -30,24 +30,27 @@ python3 clonecert.py --help
 | --- | --- |
 | `identify` | Imprime **todos los parámetros modificables** de un cert/cadena (texto o `--json`). |
 | `validate` | Comprueba que la cadena sea válida entre sus partes (firma, enlaces DN, CA, vigencia). |
-| `capture` | Captura la cadena de un servidor TLS a un directorio único + `manifest.json`. |
 | `clone` | Clona un leaf o una cadena entera; aplica modificaciones; genera manifiesto. |
 | `selftest` | Suite de regresión offline (12 casos, sin red). |
 
-Entrada común de `identify`/`validate`/`clone`:
-`--connect [sni@]host:port` (servidor en vivo) o `--in FICHERO` (PEM/DER/bundle),
-`--sni`, `--timeout`, `--chain` (toda la cadena, no solo el leaf), y
-`--transport auto|tls|starttls-smtp|…|dtls`.
+Los tres comandos toman un **argumento posicional** que es o bien un
+`[sni@]host:port` (servidor en vivo) o bien un fichero PEM/DER/bundle — se
+autodetecta. Opcionales comunes: `--sni`, `--timeout`, `--chain` (toda la
+cadena, no solo el leaf) y `--transport auto|tls|starttls-smtp|…|dtls`.
+
+```bash
+clonecert.py identify example.org:443 --chain
+clonecert.py identify chain.pem --chain --json
+clonecert.py validate chain.pem
+```
 
 ## Pautas cubiertas
 
-**Clonar un certificado web** (por `host:port`):
+**Clonar un certificado web** (por `host:port`, directo):
 
 ```bash
-python3 clonecert.py clone --connect example.org:443 --chain -d salida
-# o en dos pasos, revisando antes:
-python3 clonecert.py capture example.org:443 -d capturas
-python3 clonecert.py clone --in capturas/<dir>/example.org-chain.pem --chain -d salida
+python3 clonecert.py clone example.org:443 --chain -d salida
+python3 clonecert.py clone www.example.org@example.org:443 --chain -d salida  # con SNI
 ```
 
 **Clonar cadenas locales** (leaf, leaf→intermedia, leaf→intermedia→CA;
@@ -55,15 +58,8 @@ auto-firmadas o no). Con `--chain` se regeneran claves en **todos** los niveles
 y se re-firma de arriba abajo (soporta **N intermedias**):
 
 ```bash
-python3 clonecert.py clone --in chain.pem --chain -d salida
-python3 clonecert.py validate --in salida/*.chain.pem
-```
-
-**Identificar y validar:**
-
-```bash
-python3 clonecert.py identify --in chain.pem --chain           # o --json
-python3 clonecert.py validate --in chain.pem
+python3 clonecert.py clone chain.pem --chain -d salida
+python3 clonecert.py validate salida/*.chain.pem
 ```
 
 **Modificar cualquier parámetro de cualquier certificado.** Las banderas de
@@ -72,11 +68,11 @@ cambios en varios certificados a la vez usa `--mods fichero.json`.
 
 ```bash
 # cambiar el CN del leaf, el tipo de clave y añadir un SAN
-python3 clonecert.py clone --in chain.pem --chain \
+python3 clonecert.py clone chain.pem --chain \
   --cn evil.example.com --key ec:secp384r1 --add-san dns:extra.example.com -d out
 
 # modificar la INTERMEDIA (índice 1) y re-enlazar la cadena
-python3 clonecert.py clone --in chain.pem --chain --index 1 --cn "Rogue CA" \
+python3 clonecert.py clone chain.pem --chain --index 1 --cn "Rogue CA" \
   --recompute-ski -d out
 ```
 
@@ -128,8 +124,8 @@ python3 clonecert.py selftest    # 12 casos, offline
 
 ## Qué se rescató del `clone-cert.sh` original
 
-Subcomandos, captura con transporte automático por puerto (TLS/STARTTLS/DTLS) y
-`--transport`, directorios de captura únicos + manifiestos, `--dry-run`,
+Subcomandos, transporte automático por puerto (TLS/STARTTLS/DTLS) y
+`--transport`, `manifest.json` del clonado con provenance, `--dry-run`,
 verificación emisor↔clave y post-emisión, validaciones de entrada, `--out-dir`
 vacío + rechazo de symlinks, permisos `0600`, la derivación homoglifo del emisor
 y una suite de auto-test. Ver [`REVIEW.md`](REVIEW.md) para el detalle de qué se
